@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Link this checkout into the Omarchy shell as sastr.siriusxm and enable it.
+# Re-run after editing to load the changes: the shell's hot reload does not
+# pick up new code through the symlink (it keeps the compiled component), so
+# an already-enabled plugin gets a shell restart instead. Playback runs in its
+# own process and keeps going across the restart.
+set -euo pipefail
+
+id=sastr.siriusxm
+src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+dest="$HOME/.config/omarchy/plugins/$id"
+
+for cmd in mpv python3 secret-tool; do
+  command -v "$cmd" >/dev/null || { echo "missing dependency: $cmd" >&2; exit 1; }
+done
+
+if [[ -e $dest && ! -L $dest ]]; then
+  echo "$dest exists and is not a symlink; remove it first" >&2
+  exit 1
+fi
+
+rm -f "$dest"
+ln -s "$src" "$dest"
+
+if omarchy plugin list 2>/dev/null | grep -Eq "^$id[[:space:]]+enabled"; then
+  omarchy restart shell
+else
+  omarchy-shell shell rescanPlugins >/dev/null
+  sleep 1
+  omarchy plugin enable "$id"
+fi
+echo "Linked $dest -> $src"

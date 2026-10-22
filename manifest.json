@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "sastr.siriusxm",
+  "name": "SiriusXM",
+  "version": "0.1.0",
+  "author": "Tony Vargas",
+  "license": "MIT",
+  "description": "Listen to SiriusXM live channels from the Omarchy bar: channel browser, favorites, now playing, and media-key control through mpv.",
+  "keywords": ["siriusxm", "radio", "music", "mpris", "mpv"],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "SiriusXM",
+    "description": "SiriusXM player with a channel browser",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

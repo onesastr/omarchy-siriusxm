@@ -1,0 +1,1611 @@
+#!/usr/bin/env python3
+"""SiriusXM for Omarchy: account login, a local HLS proxy, and mpv control.
+
+One file, standard library only. `sxm daemon` runs a localhost HTTP server
+that logs in to the SiriusXM edge gateway, serves rewritten live playlists,
+decryption keys and segments to mpv, owns the mpv process, and writes a
+status file the shell widget watches. Every other subcommand is a thin
+client of that daemon (started on demand).
+
+The edge-gateway flow follows yob15662/sxm-player (Apache-2.0).
+"""
+
+import argparse
+import base64
+import collections
+import datetime as dt
+import fcntl
+import getpass
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+APP = "omarchy-siriusxm"
+API_BASE = "https://api.edge-gateway.siriusxm.com/"
+IMG_BASE = "https://imgsrv-sxm-prod-device.streaming.siriusxm.com/"
+WEB_ORIGIN = "https://www.siriusxm.com"
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+LINEUP_QUERY = {
+    "containerId": "3JoBfOCIwo6FmTpzM1S2H7",
+    "useCuratedContext": "false",
+    "entityType": "curated-grouping",
+    "entityId": "403ab6a5-d3c9-4c2a-a722-a94a6a5fd056",
+    "offset": "0",
+    "size": "1000",
+    "setStyle": "small_list",
+}
+GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+TOKEN_MARGIN = 600          # refresh tokens this many seconds before expiry
+LINEUP_MAX_AGE = 24 * 3600
+STREAM_MAX_AGE = 20 * 60    # re-tune after this long even if the URL still works
+IDLE_EXIT = 15 * 60         # daemon exits after this long stopped and unused
+DEFAULT_VOLUME = 100
+
+
+def _xdg(var, fallback):
+    return os.path.join(os.environ.get(var) or os.path.expanduser(fallback), APP)
+
+
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP}-{os.getuid()}", APP)
+STATE_DIR = _xdg("XDG_STATE_HOME", "~/.local/state")
+DATA_DIR = _xdg("XDG_DATA_HOME", "~/.local/share")
+CACHE_DIR = _xdg("XDG_CACHE_HOME", "~/.cache")
+
+DAEMON_FILE = os.path.join(RUNTIME_DIR, "daemon.json")
+DAEMON_LOCK = os.path.join(RUNTIME_DIR, "daemon.lock")
+SPAWN_LOCK = os.path.join(RUNTIME_DIR, "spawn.lock")
+DAEMON_LOG = os.path.join(RUNTIME_DIR, "daemon.log")
+STATUS_FILE = os.path.join(RUNTIME_DIR, "status.json")
+MPV_SOCKET = os.path.join(RUNTIME_DIR, "mpv.sock")
+PLAYLIST_FILE = os.path.join(RUNTIME_DIR, "channels.m3u")
+SESSION_FILE = os.path.join(STATE_DIR, "session.json")
+USER_FILE = os.path.join(DATA_DIR, "state.json")
+LINEUP_FILE = os.path.join(CACHE_DIR, "channels.json")
+LINEUP_RAW_FILE = os.path.join(CACHE_DIR, "channels.raw.json")
+
+
+class SxmError(Exception):
+    """An error with a message fit to show the user."""
+
+
+class AuthError(SxmError):
+    pass
+
+
+class ApiError(SxmError):
+    def __init__(self, status, path, body=b""):
+        self.status = status
+        self.path = path
+        self.body = body
+        snippet = body[:300].decode("utf-8", "replace") if body else ""
+        super().__init__(f"SiriusXM API {path} returned {status} {snippet}".strip())
+
+
+def log(*parts):
+    stamp = time.strftime("%H:%M:%S")
+    print(stamp, *parts, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+
+
+def ensure_dirs():
+    for path in (RUNTIME_DIR, STATE_DIR, DATA_DIR, CACHE_DIR):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def read_json(path, fallback=None):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, value, mode=0o600):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+    os.replace(temporary, path)
+
+
+def dig(value, *keys):
+    for key in keys:
+        if isinstance(value, dict):
+            value = value.get(key)
+        elif isinstance(value, list) and isinstance(key, int) and -len(value) <= key < len(value):
+            value = value[key]
+        else:
+            return None
+    return value
+
+
+def parse_time(value):
+    """Parse SiriusXM timestamps, including the '+00:00Z' form, to epoch seconds."""
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip().replace("+00:00Z", "Z")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp.timestamp()
+
+
+def iso_utc(epoch):
+    stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+
+
+def image_url(key, size=300):
+    """Turn a SiriusXM image key (or URL) into a fetchable URL."""
+    if not key or not isinstance(key, str):
+        return ""
+    if key.startswith("http://") or key.startswith("https://"):
+        return key
+    params = {"key": key, "edits": [{"format": {"type": "jpeg"}},
+                                    {"resize": {"width": size, "height": size}}]}
+    encoded = base64.b64encode(json.dumps(params, separators=(",", ":")).encode()).decode()
+    return IMG_BASE + encoded
+
+
+def pick_image(images, size=300):
+    for kind in ("tile", "logo"):
+        for aspect in ("aspect_1x1", "aspect_16x9"):
+            for variant in ("preferred", "preferredImage", "default", "defaultImage"):
+                url = dig(images, kind, aspect, variant, "url")
+                if url:
+                    return image_url(url, size)
+    return ""
+
+
+def http_request(method, url, headers=None, body=None, timeout=20):
+    request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers, error.read() if error.fp else b""
+    except (urllib.error.URLError, socket.timeout, ConnectionError) as error:
+        reason = getattr(error, "reason", error)
+        raise SxmError(f"Network error reaching {urllib.parse.urlsplit(url).netloc}: {reason}") from None
+
+
+# --------------------------------------------------------------------------
+# Credentials (GNOME Keyring / libsecret via secret-tool)
+
+
+class Keyring:
+    ATTRS = ["service", APP, "account", "default"]
+
+    @staticmethod
+    def available():
+        return shutil.which("secret-tool") is not None
+
+    @classmethod
+    def load(cls):
+        if not cls.available():
+            return None
+        result = subprocess.run(["secret-tool", "lookup", *cls.ATTRS],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            creds = json.loads(result.stdout)
+        except ValueError:
+            return None
+        if creds.get("username") and creds.get("password"):
+            return creds
+        return None
+
+    @classmethod
+    def store(cls, username, password):
+        if not cls.available():
+            raise SxmError("secret-tool is missing; install libsecret")
+        secret = json.dumps({"username": username, "password": password})
+        result = subprocess.run(["secret-tool", "store", "--label", "SiriusXM (Omarchy)", *cls.ATTRS],
+                                input=secret, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise SxmError("Could not save to the keyring: " + (result.stderr.strip() or "unknown error"))
+
+    @classmethod
+    def clear(cls):
+        if cls.available():
+            subprocess.run(["secret-tool", "clear", *cls.ATTRS], capture_output=True, timeout=10)
+
+
+# --------------------------------------------------------------------------
+# SiriusXM edge-gateway API
+
+
+class SxmApi:
+    """Token lifecycle: device grant -> anonymous session -> identity grant -> authenticated session."""
+
+    def __init__(self, session_file=SESSION_FILE, creds=Keyring.load):
+        self.session_file = session_file
+        self.creds = creds
+        self.lock = threading.RLock()
+        self.clock = 0
+        self.state = read_json(session_file, {}) or {}
+
+    # -- token bookkeeping
+
+    def _save(self):
+        write_json(self.session_file, self.state)
+
+    def _valid(self, token_key, expiry_key):
+        token = self.state.get(token_key)
+        expiry = self.state.get(expiry_key) or 0
+        return bool(token) and expiry - time.time() > TOKEN_MARGIN
+
+    def _bearer(self):
+        if self._valid("access_token", "access_expires"):
+            return self.state["access_token"]
+        if self.state.get("identity_grant") and self._valid("anon_token", "anon_expires"):
+            return self.state["identity_grant"]
+        if self._valid("anon_token", "anon_expires"):
+            return self.state["anon_token"]
+        return self.state.get("device_grant")
+
+    def reset(self, keep_device=True):
+        with self.lock:
+            device = {k: self.state[k] for k in ("device_id", "device_grant") if k in self.state}
+            self.state = device if keep_device else {}
+            self._save()
+
+    # -- raw requests
+
+    def _request(self, method, path, payload=None, query=None, bearer=True):
+        url = API_BASE + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        with self.lock:
+            self.clock += 1
+            clock = self.clock
+            token = self._bearer() if bearer else None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+            "Origin": WEB_ORIGIN,
+            "Referer": WEB_ORIGIN + "/",
+            "x-sxm-clock": f"[0,{clock}]",
+            "x-sxm-platform": "browser",
+            "x-sxm-tenant": "sxm",
+        }
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        body = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json; charset=UTF-8"
+            body = json.dumps(payload).encode()
+        status, _, data = http_request(method, url, headers, body)
+        if status < 200 or status >= 300:
+            raise ApiError(status, path, data)
+        if not data:
+            return {}
+        try:
+            return json.loads(data)
+        except ValueError:
+            raise ApiError(status, path, b"invalid JSON: " + data[:200]) from None
+
+    # -- login
+
+    def login(self):
+        """Bring the session up to an authenticated access token."""
+        with self.lock:
+            if self._valid("access_token", "access_expires"):
+                return
+            creds = self.creds()
+            if not creds:
+                raise AuthError("Not signed in. Run `sxm login` or sign in from the panel.")
+
+            if not self.state.get("device_grant"):
+                device = self._request("POST", "device/v1/devices", {
+                    "devicePlatform": "web-desktop",
+                    "deviceAttributes": {"browser": {
+                        "browserVersion": "130.0.0.0", "browser": "Chrome", "userAgent": USER_AGENT,
+                        "sdk": "web", "app": "web", "sdkVersion": "130.0.0.0", "appVersion": "130.0.0.0",
+                    }},
+                }, bearer=False)
+                if not device.get("grant"):
+                    raise SxmError("SiriusXM did not issue a device grant")
+                self.state = {"device_id": device.get("deviceId"), "device_grant": device["grant"]}
+                self._save()
+
+            if not (self.state.get("identity_grant") and self._valid("anon_token", "anon_expires")):
+                self.state.pop("access_token", None)
+                self.state.pop("identity_grant", None)
+                self.state.pop("anon_token", None)
+                anon = self._request("POST", "session/v1/sessions/anonymous", "")
+                self.state["anon_token"] = anon.get("accessToken")
+                self.state["anon_expires"] = parse_time(anon.get("accessTokenExpiresAt")) or time.time() + 3600
+                try:
+                    identity = self._request("POST", "identity/v1/identities/authenticate/password",
+                                             {"handle": creds["username"], "password": creds["password"]})
+                except ApiError as error:
+                    if error.status in (400, 401, 403, 404, 422):
+                        raise AuthError("SiriusXM rejected that email or password") from None
+                    raise
+                if not identity.get("grant"):
+                    raise AuthError("SiriusXM did not accept the login")
+                self.state["identity_grant"] = identity["grant"]
+                self._save()
+
+            session = self._request("POST", "session/v1/sessions/authenticated", "")
+            if not session.get("accessToken"):
+                raise AuthError("SiriusXM did not open an authenticated session")
+            self.state["access_token"] = session["accessToken"]
+            self.state["access_expires"] = parse_time(session.get("accessTokenExpiresAt")) or time.time() + 3600
+            self._save()
+
+    def call(self, method, path, payload=None, query=None):
+        """Authenticated request with one re-login on 401/403."""
+        self.login()
+        try:
+            return self._request(method, path, payload, query)
+        except ApiError as error:
+            if error.status not in (401, 403):
+                raise
+            log(f"{path} -> {error.status}; re-authenticating")
+            self.reset(keep_device=True)
+            self.login()
+            return self._request(method, path, payload, query)
+
+    # -- endpoints
+
+    def lineup(self):
+        query = dict(LINEUP_QUERY, key=base64.b64encode(str(uuid.uuid4()).encode()).decode())
+        return self.call("GET", "relationship/v1/container/all-channels", query=query)
+
+    def tune(self, channel_id, entity_type):
+        return self.call("POST", "playback/play/v1/tuneSource", {
+            "id": channel_id,
+            "type": entity_type or "channel-linear",
+            "hlsVersion": "V3",
+            "manifestVariant": "WEB" if (entity_type or "channel-linear") == "channel-linear" else "FULL",
+            "mtcVersion": "V2",
+        })
+
+    def key(self, guid):
+        data = self.call("GET", f"playback/key/v1/{guid}")
+        raw = base64.b64decode(data.get("key") or "")
+        if len(raw) != 16:
+            raise SxmError(f"Unexpected key length {len(raw)} for {guid}")
+        return raw
+
+    def live_update(self, channel_id):
+        now = time.time()
+        return self.call("POST", "playback/play/v1/liveUpdate", {
+            "channelId": channel_id,
+            "startTimestamp": iso_utc(now - 3 * 3600),
+            "endTimestamp": iso_utc(now + 60),
+        })
+
+
+# --------------------------------------------------------------------------
+# Pure transforms (unit tested)
+
+
+def normalize_channel(item):
+    entity = item.get("entity") or {}
+    decorations = item.get("decorations") or {}
+    texts = entity.get("texts") or {}
+
+    def text(name):
+        value = texts.get(name)
+        if isinstance(value, dict):
+            value = value.get("default") or next((v for v in value.values() if isinstance(v, str)), "")
+        return value if isinstance(value, str) else ""
+
+    number = decorations.get("channelNumber")
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        number = None
+    category = decorations.get("genre") or ""
+    if not category:
+        tags = decorations.get("contentTags") or []
+        category = tags[0] if tags and isinstance(tags[0], str) else ""
+    return {
+        "id": entity.get("id") or "",
+        "type": entity.get("type") or "channel-linear",
+        "name": text("title") or text("name") or entity.get("id") or "",
+        "description": text("description") or text("shortDescription"),
+        "number": number,
+        "category": category if isinstance(category, str) else "",
+        "logo": pick_image(entity.get("images") or {}, 160),
+        "color": dig(decorations, "hexcode", "default") or "",
+        "locked": decorations.get("unentitled") is True,
+    }
+
+
+def normalize_lineup(raw):
+    items = []
+    for group in dig(raw, "container", "sets") or []:
+        items.extend(group.get("items") or [])
+    seen = set()
+    channels = []
+    for item in items:
+        channel = normalize_channel(item)
+        if channel["id"] and channel["id"] not in seen:
+            seen.add(channel["id"])
+            channels.append(channel)
+    channels.sort(key=lambda c: (c["number"] is None, c["number"] or 0, c["name"].lower()))
+    return channels
+
+
+def select_variant(master_text, master_url):
+    """Return the absolute URL of the highest-bandwidth variant in a master playlist."""
+    lines = [line.strip() for line in master_text.splitlines()]
+    best, best_bw = None, -1
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF"):
+            continue
+        match = re.search(r"(?:^|[:,])BANDWIDTH=(\d+)", line)
+        bandwidth = int(match.group(1)) if match else 0
+        uri = next((l for l in lines[index + 1:] if l and not l.startswith("#")), None)
+        if uri and bandwidth > best_bw:
+            best, best_bw = uri, bandwidth
+    if best is None:
+        if any(l.startswith("#EXTINF") for l in lines):
+            return master_url  # already a media playlist
+        best = next((l for l in lines if l and not l.startswith("#") and ".m3u8" in l), None)
+    if best is None:
+        raise SxmError("Master playlist has no variants")
+    return urllib.parse.urljoin(master_url, best)
+
+
+def rewrite_playlist(text, base_url, prefix):
+    """Rewrite a live media playlist so keys and segments go through the local proxy.
+
+    Returns (playlist_text, {absolute_segment_url: segment_end_epoch_or_None}).
+    """
+    out, segments = [], {}
+    clock, duration = None, 0.0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-ENDLIST") or line.startswith("#EXT-X-PLAYLIST-TYPE"):
+            continue  # always treat as a live sliding window
+        if line.startswith("#EXT-X-KEY"):
+            guids = GUID_RE.findall(line)
+            if guids and 'URI="' in line:
+                line = re.sub(r'URI="[^"]*"', f'URI="{prefix}/key/{guids[-1]}"', line)
+            out.append(line)
+            continue
+        if line.startswith("#EXT-X-MAP") and 'URI="' in line:
+            def proxy_map(match):
+                absolute = urllib.parse.urljoin(base_url, match.group(1))
+                segments[absolute] = None
+                return f'URI="{prefix}/seg?u={urllib.parse.quote(absolute, safe="")}"'
+            out.append(re.sub(r'URI="([^"]*)"', proxy_map, line))
+            continue
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            clock = parse_time(line.split(":", 1)[1])
+            out.append(line)
+            continue
+        if line.startswith("#EXTINF:"):
+            try:
+                duration = float(line[8:].split(",", 1)[0])
+            except ValueError:
+                duration = 0.0
+            out.append(line)
+            continue
+        if line.startswith("#"):
+            out.append(line)
+            continue
+        absolute = urllib.parse.urljoin(base_url, line)
+        if clock is not None:
+            clock += duration
+        segments[absolute] = clock
+        out.append(f"{prefix}/seg?u={urllib.parse.quote(absolute, safe='')}")
+    return "\n".join(out) + "\n", segments
+
+
+def current_cut(items, position):
+    """Pick the track/show playing at epoch `position` from liveUpdate items."""
+    cuts = []
+    for item in items or []:
+        start = parse_time(item.get("timestamp") or item.get("startTime"))
+        if start is None:
+            continue
+        length = item.get("duration") or 0
+        try:
+            length = float(length) / 1000.0
+        except (TypeError, ValueError):
+            length = 0.0
+        cuts.append((start, start + length, item))
+    if not cuts:
+        return None
+    cuts.sort(key=lambda c: c[0])
+    playing = [c for c in cuts if c[0] <= position <= c[1] + 1]
+    if playing:
+        return playing[-1][2]
+    started = [c for c in cuts if c[0] <= position]
+    return (started[-1] if started else cuts[0])[2]
+
+
+def volume_level(ao_volume):
+    """mpv ao-volume -> the 0-100 level Omarchy's audio panel displays."""
+    return max(0, min(100, round(float(ao_volume))))
+
+
+def describe_cut(item):
+    if not item:
+        return {"artist": "", "title": "", "album": "", "art": "", "interstitial": False}
+    return {
+        "artist": item.get("artistName") or "",
+        "title": item.get("name") or "",
+        "album": item.get("albumName") or "",
+        "art": pick_image(item.get("images") or {}, 300) or pick_image(item.get("artistImages") or {}, 300),
+        "interstitial": bool(item.get("isInterstitial")),
+    }
+
+
+# --------------------------------------------------------------------------
+# User state (favorites, volume, last channel) — shared by CLI and daemon
+
+
+def user_state():
+    state = read_json(USER_FILE, {}) or {}
+    favorites = state.get("favorites")
+    state["favorites"] = [f for f in favorites if isinstance(f, str)] if isinstance(favorites, list) else []
+    volume = state.get("volume")
+    state["volume"] = int(volume) if isinstance(volume, (int, float)) and 0 <= volume <= 130 else DEFAULT_VOLUME
+    if not isinstance(state.get("last"), str):
+        state["last"] = ""
+    return state
+
+
+def update_user_state(**changes):
+    with open(os.path.join(DATA_DIR, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = user_state()
+        state.update(changes)
+        write_json(USER_FILE, state)
+        return state
+
+
+# --------------------------------------------------------------------------
+# mpv control over JSON IPC
+
+
+def kill_strays(keep=None):
+    """Terminate mpv processes left behind on our IPC socket by an earlier daemon."""
+    marker = f"--input-ipc-server={MPV_SOCKET}".encode()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == keep:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                argv = handle.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"mpv" and marker in argv:
+            try:
+                os.kill(int(entry), signal.SIGTERM)
+                log(f"killed stray mpv {entry}")
+            except OSError:
+                pass
+
+
+class Mpv:
+    OBSERVED = ["pause", "ao-volume", "ao-mute", "path", "idle-active", "demuxer-cache-duration"]
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.proc = None
+        self.sock = None
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.next_id = 0
+        self.props = {}
+        self.start_lock = threading.Lock()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, volume):
+        with self.start_lock:  # concurrent play requests must not spawn several mpvs
+            self._start(volume)
+
+    def _start(self, volume):
+        if self.alive():
+            return
+        if not shutil.which("mpv"):
+            raise SxmError("mpv is not installed")
+        kill_strays()
+        try:
+            os.unlink(MPV_SOCKET)
+        except FileNotFoundError:
+            pass
+        self.props = {}
+        mpv_log = open(os.path.join(RUNTIME_DIR, "mpv.log"), "w")
+        self.proc = subprocess.Popen([
+            "mpv", "--no-video", "--idle=yes", "--no-terminal", "--force-window=no",
+            f"--input-ipc-server={MPV_SOCKET}", "--volume=100",
+            "--audio-client-name=SiriusXM", "--title=SiriusXM",
+            "--cache=yes", "--cache-secs=30", "--loop-playlist=inf",
+            *os.environ.get("SXM_MPV_ARGS", "").split(),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=mpv_log, start_new_session=True)
+        mpv_log.close()
+        for _ in range(100):
+            if os.path.exists(MPV_SOCKET):
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect(MPV_SOCKET)
+                    self.sock = sock
+                    break
+                except OSError:
+                    sock.close()
+            if not self.alive():
+                break
+            time.sleep(0.05)
+        if self.sock is None:
+            self.quit()
+            raise SxmError("mpv failed to start; see " + os.path.join(RUNTIME_DIR, "mpv.log"))
+        threading.Thread(target=self._reader, args=(self.sock,), daemon=True).start()
+        for index, name in enumerate(self.OBSERVED, 1):
+            self._send({"command": ["observe_property", index, name]})
+
+    def _send(self, message):
+        data = (json.dumps(message) + "\n").encode()
+        with self.lock:
+            if self.sock is None:
+                raise SxmError("mpv is not running")
+            self.sock.sendall(data)
+
+    def command(self, *args, timeout=5):
+        with self.lock:
+            self.next_id += 1
+            request_id = self.next_id
+            waiter = self.pending[request_id] = [threading.Event(), None]
+        self._send({"command": list(args), "request_id": request_id})
+        if not waiter[0].wait(timeout):
+            self.pending.pop(request_id, None)
+            raise SxmError(f"mpv did not answer {args[0]}")
+        reply = waiter[1] or {}
+        if reply.get("error") not in (None, "success"):
+            raise SxmError(f"mpv {args[0]}: {reply.get('error')}")
+        return reply.get("data")
+
+    def _reader(self, sock):
+        buffer = b""
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                if "request_id" in message and message["request_id"] in self.pending:
+                    waiter = self.pending.pop(message["request_id"])
+                    waiter[1] = message
+                    waiter[0].set()
+                elif message.get("event") == "property-change":
+                    self.props[message.get("name")] = message.get("data")
+                    self.on_change(message.get("name"))
+                elif message.get("event") in ("end-file", "file-loaded", "start-file"):
+                    self.props["last-event"] = message
+                    self.on_change(message.get("event"))
+        with self.lock:
+            if self.sock is sock:
+                self.sock = None
+        self.on_change("exit")
+
+    def quit(self):
+        if self.alive():
+            try:
+                self._send({"command": ["quit"]})
+                self.proc.wait(timeout=3)
+            except (SxmError, OSError, subprocess.TimeoutExpired):
+                self.proc.kill()
+        with self.lock:
+            if self.sock is not None:
+                self.sock.close()
+                self.sock = None
+        self.proc = None
+        self.props = {}
+
+
+# --------------------------------------------------------------------------
+# The daemon
+
+
+def serialized(method):
+    def wrapper(self, *args, **kwargs):
+        with self.player_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+class Daemon:
+    def __init__(self):
+        self.api = SxmApi()
+        self.token = secrets.token_urlsafe(18)
+        self.port = 0
+        self.lineup = []
+        self.lineup_lock = threading.Lock()
+        self.streams = {}            # channel id -> {"variant": url, "tuned": epoch}
+        self.stream_lock = threading.Lock()
+        self.keys = {}
+        self.segments = collections.OrderedDict()   # allowed upstream URL -> PDT epoch
+        self.segment_lock = threading.Lock()
+        self.cuts = {}               # channel id -> {"items": [...], "fetched": epoch}
+        self.last_segment = None     # (channel id, segment end epoch)
+        self.logged_in = Keyring.load() is not None
+        self.retuned_at = 0
+        self.halting = False         # ignore mpv's own auto-advance after a failure
+        self.ao_ready = False        # mpv has reported its audio-output volume
+        self.volume_lock = threading.Lock()
+        self.player_lock = threading.RLock()
+        self.widget_alive_at = 0.0   # bar widget presence, see watch_volume
+        self.widget_gone_at = 0.0
+        self.volume_set_at = 0.0
+        self.mpv = Mpv(self._mpv_changed)
+        self.channel_id = ""
+        self.track = describe_cut(None)
+        self.error = ""
+        self.loading = False
+        self.last_activity = time.time()
+        self.status_lock = threading.Lock()
+        self.last_status = None
+        self.shutdown = threading.Event()
+
+    # -- lineup
+
+    def channels(self, refresh=False):
+        with self.lineup_lock:
+            if self.lineup and not refresh:
+                return self.lineup
+            cached = read_json(LINEUP_FILE, {}) or {}
+            fresh = time.time() - (cached.get("updated") or 0) < LINEUP_MAX_AGE
+            if cached.get("channels") and fresh and not refresh:
+                self.lineup = cached["channels"]
+                return self.lineup
+            try:
+                raw = self.api.lineup()
+            except SxmError:
+                if cached.get("channels"):
+                    self.lineup = cached["channels"]
+                    return self.lineup
+                raise
+            write_json(LINEUP_RAW_FILE, raw)
+            channels = normalize_lineup(raw)
+            if not channels:
+                raise SxmError("SiriusXM returned an empty channel lineup; see " + LINEUP_RAW_FILE)
+            write_json(LINEUP_FILE, {"updated": int(time.time()), "channels": channels}, mode=0o644)
+            self.lineup = channels
+            return channels
+
+    def find_channel(self, query):
+        channels = self.channels()
+        query = str(query).strip()
+        lowered = query.lower()
+        for channel in channels:
+            if channel["id"] == query:
+                return channel
+        if query.isdigit():
+            for channel in channels:
+                if channel["number"] == int(query):
+                    return channel
+        for channel in channels:
+            if channel["name"].lower() == lowered:
+                return channel
+        matches = [c for c in channels if lowered in c["name"].lower()]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise SxmError(f"'{query}' matches {len(matches)} channels: "
+                           + ", ".join(c["name"] for c in matches[:6]))
+        raise SxmError(f"No channel matches '{query}'")
+
+    # -- streaming
+
+    def prefix(self):
+        return f"http://127.0.0.1:{self.port}/{self.token}"
+
+    def _variant_url(self, channel, force=False):
+        with self.stream_lock:
+            cached = self.streams.get(channel["id"])
+            if cached and not force and time.time() - cached["tuned"] < STREAM_MAX_AGE:
+                return cached["variant"]
+        tuned = self.api.tune(channel["id"], channel["type"])
+        stream = (tuned.get("streams") or [{}])[0]
+        urls = stream.get("urls") or []
+        choice = next((u for u in urls if u.get("isPrimary")), urls[0] if urls else None)
+        if not choice or not choice.get("url"):
+            raise SxmError(f"No stream URL for {channel['name']}")
+        live_items = dig(stream, "metadata", "live", "items")
+        if live_items:
+            self.cuts[channel["id"]] = {"items": live_items, "fetched": time.time()}
+        status, _, body = http_request("GET", choice["url"], {"User-Agent": USER_AGENT})
+        if status != 200:
+            raise SxmError(f"Master playlist returned {status}")
+        variant = select_variant(body.decode("utf-8", "replace"), choice["url"])
+        with self.stream_lock:
+            self.streams[channel["id"]] = {"variant": variant, "tuned": time.time()}
+        return variant
+
+    def playlist(self, channel_id):
+        channel = next((c for c in self.channels() if c["id"] == channel_id), None)
+        if channel is None:
+            raise SxmError(f"Unknown channel {channel_id}")
+        for attempt in range(2):
+            variant = self._variant_url(channel, force=attempt > 0)
+            status, _, body = http_request("GET", variant, {"User-Agent": USER_AGENT})
+            if status == 200:
+                break
+            log(f"variant playlist {status} for {channel['name']}; re-tuning")
+        else:
+            raise SxmError(f"Stream for {channel['name']} is unavailable ({status})")
+        text, segments = rewrite_playlist(body.decode("utf-8", "replace"), variant, self.prefix())
+        with self.segment_lock:
+            for url, pdt in segments.items():
+                self.segments[url] = (channel_id, pdt)
+                self.segments.move_to_end(url)
+            while len(self.segments) > 4000:
+                self.segments.popitem(last=False)
+        return text
+
+    def key(self, guid):
+        if guid not in self.keys:
+            self.keys[guid] = self.api.key(guid)
+        return self.keys[guid]
+
+    def segment_allowed(self, url):
+        with self.segment_lock:
+            return self.segments.get(url, False)
+
+    def note_segment(self, entry):
+        channel_id, end = entry
+        if end is not None:
+            self.last_segment = (channel_id, end)
+
+    # -- now playing
+
+    def playback_position(self):
+        """Best estimate of the wall-clock time of the audio being heard."""
+        if self.last_segment and self.last_segment[0] == self.channel_id:
+            buffered = self.mpv.props.get("demuxer-cache-duration")
+            buffered = float(buffered) if isinstance(buffered, (int, float)) else 10.0
+            return self.last_segment[1] - buffered
+        return time.time() - 30
+
+    def refresh_now_playing(self):
+        channel_id = self.channel_id
+        if not channel_id or not self.mpv.alive():
+            return
+        cached = self.cuts.get(channel_id)
+        position = self.playback_position()
+        cut = current_cut(cached["items"], position) if cached else None
+        stale = not cached or time.time() - cached["fetched"] > 180
+        if cut:
+            start = parse_time(cut.get("timestamp")) or 0
+            end = start + float(cut.get("duration") or 0) / 1000.0
+            if end and position > end + 5:
+                stale = True
+        if stale:
+            try:
+                data = self.api.live_update(channel_id)
+                self.cuts[channel_id] = {"items": data.get("items") or [], "fetched": time.time()}
+                cut = current_cut(self.cuts[channel_id]["items"], position)
+            except SxmError as error:
+                log("liveUpdate failed:", error)
+        track = describe_cut(cut)
+        if track != self.track:
+            self.track = track
+            self._push_media_title()
+            self.write_status()
+
+    def _push_media_title(self):
+        channel = self.current_channel() or {}
+        if self.track["title"] and not self.track["interstitial"]:
+            title = " — ".join(p for p in (self.track["artist"], self.track["title"]) if p)
+        else:
+            title = channel.get("name") or "SiriusXM"
+        try:
+            if self.mpv.alive():
+                self.mpv.command("set_property", "force-media-title", title)
+        except SxmError:
+            pass
+
+    def current_channel(self):
+        return next((c for c in self.lineup if c["id"] == self.channel_id), None)
+
+    # -- player commands
+
+    @serialized
+    def play(self, query):
+        self.api.login()  # fail fast with a clear message instead of a dead stream
+        channel = self.find_channel(query)
+        state = user_state()
+        favorites = state["favorites"]
+        ring = [c for c in self.lineup if c["id"] in favorites]
+        if channel["id"] not in favorites or len(ring) < 2:
+            ring = self.lineup
+        index = next(i for i, c in enumerate(ring) if c["id"] == channel["id"])
+        lines = ["#EXTM3U"]
+        for c in ring:
+            label = f"{c['number']} · {c['name']}" if c["number"] is not None else c["name"]
+            lines.append(f"#EXTINF:-1,{label}")
+            lines.append(f"{self.prefix()}/live/{c['id']}.m3u8")
+        with open(PLAYLIST_FILE, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        self.error = ""
+        self.loading = True
+        self.halting = False
+        self.channel_id = channel["id"]
+        self.track = describe_cut(None)
+        if not self.mpv.alive():
+            self.ao_ready = False
+        self.mpv.start(state["volume"])
+        self.mpv.command("set_property", "playlist-start", index)
+        self.mpv.command("loadlist", PLAYLIST_FILE, "replace")
+        self.mpv.command("set_property", "pause", False)
+        update_user_state(last=channel["id"])
+        self.write_status()
+        threading.Thread(target=self.refresh_now_playing, daemon=True).start()
+        return channel
+
+    @serialized
+    def stop(self):
+        self.mpv.quit()
+        self.loading = False
+        self.write_status()
+
+    @serialized
+    def toggle(self):
+        if not self.mpv.alive() or self.mpv.props.get("idle-active"):
+            last = user_state()["last"] or (self.channels()[0]["id"] if self.channels() else "")
+            if not last:
+                raise SxmError("No channel to play")
+            self.play(last)
+            return
+        self.mpv.command("cycle", "pause")
+
+    @serialized
+    def step(self, direction):
+        if not self.mpv.alive():
+            self.toggle()
+            return
+        self.mpv.command("playlist-next" if direction > 0 else "playlist-prev", "force")
+
+    # Volume lives on the PipeWire stream (mpv's ao-volume), the same control
+    # and the same linear 0-100 scale Omarchy's audio panel shows for the
+    # "SiriusXM" stream, so the two never fight. mpv's own software volume
+    # stays pinned at 100.
+
+    def current_volume(self):
+        linear = self.mpv.props.get("ao-volume") if self.mpv.alive() else None
+        return volume_level(linear) if isinstance(linear, (int, float)) else user_state()["volume"]
+
+    def set_volume(self, value):
+        if isinstance(value, str) and value[:1] in "+-":
+            target = self.current_volume() + int(value)
+        else:
+            target = int(value)
+        target = max(0, min(100, target))
+        with self.volume_lock:
+            update_user_state(volume=target)
+            if self.mpv.alive():
+                try:
+                    self.mpv.command("set_property", "ao-volume", target)
+                    # Record it now: mpv reports the old level until PipeWire
+                    # acknowledges, and a stale status makes the slider jump back.
+                    self.mpv.props["ao-volume"] = target
+                    self.volume_set_at = time.time()
+                except SxmError:
+                    pass  # audio output not open yet; applied when it opens
+        self.write_status()
+        return target
+
+    def _apply_saved_volume(self):
+        linear = user_state()["volume"]
+        try:
+            self.mpv.command("set_property", "ao-volume", linear)
+            self.mpv.props["ao-volume"] = linear
+        except SxmError:
+            self.ao_ready = False
+        self.write_status()
+
+    def _halt(self):
+        try:
+            self.mpv.command("stop")
+        except SxmError:
+            pass
+        self.write_status()
+
+    def _retune(self, channel_id):
+        if time.time() - self.retuned_at < 30:
+            self.error = "Stream ended unexpectedly"
+            self._halt()
+            return
+        self.retuned_at = time.time()
+        with self.stream_lock:
+            self.streams.pop(channel_id, None)
+        try:
+            self.play(channel_id)
+        except SxmError as error:
+            self.error = str(error)
+            self.write_status()
+
+    def _mpv_changed(self, name):
+        if name == "ao-volume" and self.ao_ready and isinstance(self.mpv.props.get("ao-volume"), (int, float)):
+            level = volume_level(self.mpv.props["ao-volume"])
+            if level != user_state()["volume"]:
+                update_user_state(volume=level)  # changed elsewhere, e.g. Omarchy's audio panel
+        if name == "path":
+            path = self.mpv.props.get("path") or ""
+            match = re.search(r"/live/([^/]+)\.m3u8$", path)
+            if self.halting:
+                match = None
+            if match and match.group(1) != self.channel_id:
+                self.channel_id = match.group(1)
+                self.track = describe_cut(None)
+                update_user_state(last=self.channel_id)
+                threading.Thread(target=self.refresh_now_playing, daemon=True).start()
+            if match:
+                threading.Thread(target=self._push_media_title, daemon=True).start()
+        elif name == "start-file":
+            self.loading = True
+        elif name == "file-loaded":
+            self.loading = False
+            self.error = ""
+        elif name == "end-file":
+            # mpv would advance to the next channel on its own; keep the listener
+            # on the channel they chose instead. Commands can't run on the reader
+            # thread (it delivers their replies), so hand off to a worker.
+            event = self.mpv.props.get("last-event") or {}
+            reason = event.get("reason")
+            if reason in ("error", "eof"):
+                self.halting = True
+            if reason == "error":
+                self.loading = False
+                self.error = "Stream failed: " + str(event.get("file_error") or "unknown error")
+                threading.Thread(target=self._halt, daemon=True).start()
+            elif reason == "eof" and self.channel_id:
+                threading.Thread(target=self._retune, args=(self.channel_id,), daemon=True).start()
+        elif name == "exit":
+            self.loading = False
+        if name != "demuxer-cache-duration":
+            self.write_status()
+
+    # -- status
+
+    def status(self):
+        alive = self.mpv.alive()
+        props = self.mpv.props if alive else {}
+        if not alive:
+            state = "error" if self.error else "stopped"
+        elif self.error:
+            state = "error"
+        elif self.loading:
+            state = "loading"
+        elif props.get("pause"):
+            state = "paused"
+        else:
+            state = "playing"
+        user = user_state()
+        volume = props.get("ao-volume")
+        return {
+            "daemon": True,
+            "running": alive,
+            "state": state,
+            "channel": self.current_channel() if alive else None,
+            "track": self.track if alive else describe_cut(None),
+            "volume": volume_level(volume) if isinstance(volume, (int, float)) else user["volume"],
+            "muted": bool(props.get("ao-mute")),
+            "error": self.error,
+            "loggedIn": self.logged_in,
+            "last": user["last"],
+        }
+
+    def write_status(self):
+        with self.status_lock:
+            status = self.status()
+            if status != self.last_status:
+                write_json(STATUS_FILE, status, mode=0o644)
+                self.last_status = status
+
+    # -- control dispatch
+
+    def handle_command(self, request):
+        self.last_activity = time.time()
+        command = request.get("cmd")
+        if command == "ping":
+            return {"ok": True}
+        if command == "status":
+            return self.status()
+        if command == "channels":
+            return {"channels": self.channels(refresh=bool(request.get("refresh")))}
+        if command == "play":
+            return {"channel": self.play(request.get("id", ""))}
+        if command == "stop":
+            self.stop()
+            return {"ok": True}
+        if command == "toggle":
+            self.toggle()
+            return {"ok": True}
+        if command in ("next", "prev"):
+            self.step(1 if command == "next" else -1)
+            return {"ok": True}
+        if command == "volume":
+            return {"volume": self.set_volume(request.get("value", DEFAULT_VOLUME))}
+        if command == "widget":
+            log("widget", request.get("state"))
+            if request.get("state") == "gone":
+                self.widget_gone_at = time.time()
+            else:
+                self.widget_alive_at = time.time()
+            return {"ok": True}
+        if command == "relogin":
+            self.api.reset(keep_device=True)
+            self.logged_in = True
+            self.error = ""
+            self.write_status()
+            return {"ok": True}
+        if command == "raw":
+            what = request.get("what")
+            if what == "lineup":
+                return self.api.lineup()
+            channel = self.find_channel(request.get("id", ""))
+            if what == "tune":
+                return self.api.tune(channel["id"], channel["type"])
+            if what == "live":
+                return self.api.live_update(channel["id"])
+            raise SxmError("raw: expected lineup, tune or live")
+        if command == "quit":
+            threading.Thread(target=self.quit, daemon=True).start()
+            return {"ok": True}
+        raise SxmError(f"Unknown command {command!r}")
+
+    def quit(self):
+        self.mpv.quit()
+        self.shutdown.set()
+
+    # -- lifecycle
+
+    def watch_volume(self):
+        """mpv never re-reads the stream volume on its own, so changes made in
+        Omarchy's audio panel (or wpctl) would go unseen without polling."""
+        while not self.shutdown.wait(1):
+            if self.widget_gone_at > self.widget_alive_at and time.time() - self.widget_gone_at > 5:
+                # The bar widget was removed (plugin disabled) and no reload
+                # brought it back: stop playing instead of lingering unseen.
+                log("bar widget gone; stopping")
+                self.quit()
+                return
+            if not self.mpv.alive():
+                continue
+            try:
+                linear = self.mpv.command("get_property", "ao-volume", timeout=2)
+            except SxmError:
+                continue  # audio output not open yet
+            if not self.ao_ready:
+                # Output just opened: impose the saved level rather than
+                # adopting whatever the stream started at.
+                self.ao_ready = True
+                self._apply_saved_volume()
+                continue
+            with self.volume_lock:
+                # Readings right after our own change can predate it.
+                if time.time() - self.volume_set_at < 2:
+                    continue
+                if not isinstance(linear, (int, float)) or abs(linear - (self.mpv.props.get("ao-volume") or -1)) <= 0.01:
+                    continue
+                self.mpv.props["ao-volume"] = linear
+            self._mpv_changed("ao-volume")
+
+    def background(self):
+        while not self.shutdown.wait(10):
+            try:
+                if self.mpv.alive():
+                    self.last_activity = time.time()
+                    self.refresh_now_playing()
+                elif time.time() - self.last_activity > IDLE_EXIT:
+                    log("idle; exiting")
+                    self.shutdown.set()
+                self.write_status()
+            except Exception as error:  # keep the loop alive no matter what
+                log("background:", error)
+
+    def serve(self):
+        ensure_dirs()
+        lock = open(DAEMON_LOCK, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SxmError("sxm daemon is already running") from None
+        kill_strays()
+        server = ProxyServer(("127.0.0.1", 0), ProxyHandler)
+        server.daemon_ref = self
+        self.port = server.server_address[1]
+        write_json(DAEMON_FILE, {"port": self.port, "token": self.token, "pid": os.getpid()})
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, lambda *_: self.shutdown.set())
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.background, daemon=True).start()
+        threading.Thread(target=self.watch_volume, daemon=True).start()
+        log(f"listening on 127.0.0.1:{self.port}")
+        self.write_status()
+        try:
+            self.shutdown.wait()
+        finally:
+            self.mpv.quit()
+            server.shutdown()
+            try:
+                if (read_json(DAEMON_FILE, {}) or {}).get("pid") == os.getpid():
+                    os.unlink(DAEMON_FILE)
+            except OSError:
+                pass
+            write_json(STATUS_FILE, offline_status(), mode=0o644)
+
+
+class ProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "sxm"
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("SXM_DEBUG"):
+            log("http", fmt % args)
+
+    def _reply(self, status, body=b"", content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, status, value):
+        self._reply(status, json.dumps(value, ensure_ascii=False).encode())
+
+    def _route(self):
+        daemon = self.server.daemon_ref
+        parts = urllib.parse.urlsplit(self.path)
+        prefix = f"/{daemon.token}/"
+        if not parts.path.startswith(prefix):
+            return None, None, None
+        return daemon, parts.path[len(prefix):], urllib.parse.parse_qs(parts.query)
+
+    def do_GET(self):
+        daemon, route, query = self._route()
+        if daemon is None:
+            self._reply(404, b"not found", "text/plain")
+            return
+        try:
+            if route.startswith("live/") and route.endswith(".m3u8"):
+                text = daemon.playlist(route[5:-5])
+                self._reply(200, text.encode(), "application/vnd.apple.mpegurl")
+            elif route.startswith("key/"):
+                self._reply(200, daemon.key(route[4:]), "application/octet-stream")
+            elif route == "seg":
+                self._segment(daemon, (query.get("u") or [""])[0])
+            else:
+                self._reply(404, b"not found", "text/plain")
+        except SxmError as error:
+            log("GET", route.split("?")[0][:60], "->", error)
+            daemon.error = str(error)
+            self._reply(502, str(error).encode(), "text/plain")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    do_HEAD = do_GET
+
+    def _segment(self, daemon, url):
+        entry = daemon.segment_allowed(url)
+        if entry is False:
+            self._reply(403, b"segment not issued by this proxy", "text/plain")
+            return
+        for attempt in range(2):
+            try:
+                status, headers, data = http_request("GET", url, {"User-Agent": USER_AGENT})
+            except SxmError:
+                if attempt:
+                    raise
+                continue
+            if status == 200 or status in (403, 404, 410):
+                break
+        if status != 200:
+            self._reply(status, b"", "text/plain")
+            return
+        daemon.note_segment(entry)
+        self._reply(200, data, headers.get("Content-Type") or "application/octet-stream")
+
+    def do_POST(self):
+        daemon, route, _ = self._route()
+        if daemon is None or route != "cmd":
+            self._reply(404, b"not found", "text/plain")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            request = json.loads(self.rfile.read(min(length, 65536)) or b"{}")
+            self._json(200, daemon.handle_command(request))
+        except SxmError as error:
+            if isinstance(error, AuthError):
+                daemon.error = str(error)
+                daemon.logged_in = Keyring.load() is not None
+                daemon.write_status()
+            self._json(400, {"error": str(error), "auth": isinstance(error, AuthError)})
+        except ValueError:
+            self._json(400, {"error": "invalid request"})
+        except Exception as error:
+            log("command failed:", repr(error))
+            self._json(500, {"error": f"internal error: {error}"})
+
+
+# --------------------------------------------------------------------------
+# Client side
+
+
+def offline_status():
+    user = user_state()
+    return {
+        "daemon": False, "running": False, "state": "stopped", "channel": None,
+        "track": describe_cut(None), "volume": user["volume"], "muted": False,
+        "error": "", "loggedIn": Keyring.load() is not None, "last": user["last"],
+    }
+
+
+def daemon_info():
+    info = read_json(DAEMON_FILE)
+    if not info or not info.get("port") or not info.get("token"):
+        return None
+    return info
+
+
+def send(info, request, timeout=30):
+    url = f"http://127.0.0.1:{info['port']}/{info['token']}/cmd"
+    body = json.dumps(request).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read() or b"{}")
+        except ValueError:
+            payload = {}
+        raise (AuthError if payload.get("auth") else SxmError)(payload.get("error") or f"daemon returned {error.code}") from None
+
+
+def ping(info):
+    try:
+        return send(info, {"cmd": "ping"}, timeout=2).get("ok") is True
+    except (SxmError, OSError, ValueError):
+        return False
+
+
+def ensure_daemon():
+    ensure_dirs()
+    info = daemon_info()
+    if info and ping(info):
+        return info
+    with open(SPAWN_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        info = daemon_info()
+        if info and ping(info):
+            return info
+        try:
+            os.unlink(DAEMON_FILE)
+        except FileNotFoundError:
+            pass
+        with open(DAEMON_LOG, "a") as log_handle:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon"],
+                             stdin=subprocess.DEVNULL, stdout=log_handle, stderr=log_handle,
+                             start_new_session=True, close_fds=True)
+        for _ in range(100):
+            time.sleep(0.05)
+            info = daemon_info()
+            if info and ping(info):
+                return info
+    raise SxmError("Could not start the sxm daemon; see " + DAEMON_LOG)
+
+
+def run_command(request, timeout=45):
+    return send(ensure_daemon(), request, timeout=timeout)
+
+
+def print_json(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def cmd_login(args):
+    if args.stdin:
+        try:
+            data = json.loads(sys.stdin.readline())
+        except ValueError:
+            raise SxmError("Expected JSON {\"username\": ..., \"password\": ...} on stdin") from None
+        username, password = str(data.get("username", "")).strip(), str(data.get("password", ""))
+    else:
+        username = input("SiriusXM email: ").strip()
+        password = getpass.getpass("SiriusXM password: ")
+    if not username or not password:
+        raise SxmError("Email and password are both required")
+    ensure_dirs()
+    api = SxmApi(creds=lambda: {"username": username, "password": password})
+    api.reset(keep_device=True)
+    api.login()
+    Keyring.store(username, password)
+    info = daemon_info()
+    if info and ping(info):
+        send(info, {"cmd": "relogin"})
+    write_json(STATUS_FILE, dict(read_json(STATUS_FILE, {}) or offline_status(), loggedIn=True, error=""), mode=0o644)
+    print("Signed in to SiriusXM as", username)
+
+
+def cmd_logout(_args):
+    info = daemon_info()
+    if info and ping(info):
+        send(info, {"cmd": "quit"})
+    Keyring.clear()
+    for path in (SESSION_FILE,):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    write_json(STATUS_FILE, dict(offline_status(), loggedIn=False), mode=0o644)
+    print("Signed out")
+
+
+def cmd_status(args):
+    info = daemon_info()
+    status = send(info, {"cmd": "status"}, timeout=5) if info and ping(info) else None
+    if status is None:
+        ensure_dirs()
+        status = offline_status()
+        write_json(STATUS_FILE, status, mode=0o644)
+    if args.json:
+        print_json(status)
+        return
+    channel = status.get("channel") or {}
+    track = status.get("track") or {}
+    print(f"state:   {status['state']}" + (f" ({status['error']})" if status.get("error") else ""))
+    if channel:
+        print(f"channel: {channel.get('number') or ''} {channel.get('name')}".rstrip())
+    if track.get("title"):
+        print(f"track:   {track.get('artist')} — {track.get('title')}")
+    print(f"volume:  {status.get('volume')}%")
+    print(f"login:   {'yes' if status.get('loggedIn') else 'no'}")
+
+
+def cmd_channels(args):
+    channels = run_command({"cmd": "channels", "refresh": args.refresh}, timeout=60)["channels"]
+    if args.json:
+        print_json(channels)
+        return
+    favorites = set(user_state()["favorites"])
+    for channel in channels:
+        star = "★" if channel["id"] in favorites else " "
+        number = channel["number"] if channel["number"] is not None else "-"
+        print(f"{star} {number:>4}  {channel['name']:<32}  {channel['category']}")
+
+
+def cmd_fav(args):
+    channels = read_json(LINEUP_FILE, {}).get("channels") or []
+    target = next((c for c in channels if args.channel in (c["id"], str(c["number"]))), None)
+    channel_id = target["id"] if target else args.channel
+    favorites = user_state()["favorites"]
+    if channel_id in favorites:
+        favorites.remove(channel_id)
+        added = False
+    else:
+        favorites.append(channel_id)
+        added = True
+    update_user_state(favorites=favorites)
+    print(("Added " if added else "Removed ") + (target["name"] if target else channel_id))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="sxm", description="SiriusXM for Omarchy")
+    sub = parser.add_subparsers(dest="command", required=True)
+    login = sub.add_parser("login", help="sign in and store credentials in the keyring")
+    login.add_argument("--stdin", action="store_true", help="read JSON credentials from stdin")
+    sub.add_parser("logout", help="forget credentials and stop playback")
+    status = sub.add_parser("status", help="show playback status")
+    status.add_argument("--json", action="store_true")
+    channels = sub.add_parser("channels", help="list channels")
+    channels.add_argument("--refresh", action="store_true")
+    channels.add_argument("--json", action="store_true")
+    play = sub.add_parser("play", help="play a channel by number, name or id")
+    play.add_argument("channel", nargs="+")
+    for name, text in (("stop", "stop playback"), ("toggle", "play/pause"),
+                       ("next", "next channel"), ("prev", "previous channel")):
+        sub.add_parser(name, help=text)
+    volume = sub.add_parser("volume", help="set volume: 0-100, +5 or -5")
+    volume.add_argument("value")
+    fav = sub.add_parser("fav", help="toggle a favorite channel")
+    fav.add_argument("channel")
+    raw = sub.add_parser("raw", help="dump raw API responses for debugging")
+    raw.add_argument("what", choices=["lineup", "tune", "live"])
+    raw.add_argument("channel", nargs="?", default="")
+    widget = sub.add_parser("widget", help=argparse.SUPPRESS)
+    widget.add_argument("state", choices=["alive", "gone"])
+    sub.add_parser("daemon", help="run the proxy daemon in the foreground")
+    sub.add_parser("quit", help="stop the daemon")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "login":
+            cmd_login(args)
+        elif args.command == "logout":
+            cmd_logout(args)
+        elif args.command == "status":
+            cmd_status(args)
+        elif args.command == "channels":
+            cmd_channels(args)
+        elif args.command == "fav":
+            ensure_dirs()
+            cmd_fav(args)
+        elif args.command == "play":
+            channel = run_command({"cmd": "play", "id": " ".join(args.channel)})["channel"]
+            print("Playing", channel["name"])
+        elif args.command in ("stop", "toggle", "next", "prev"):
+            run_command({"cmd": args.command})
+        elif args.command == "volume":
+            print(run_command({"cmd": "volume", "value": args.value})["volume"])
+        elif args.command == "raw":
+            print_json(run_command({"cmd": "raw", "what": args.what, "id": args.channel}, timeout=60))
+        elif args.command == "widget":
+            info = daemon_info()  # never starts the daemon
+            if info and ping(info):
+                send(info, {"cmd": "widget", "state": args.state}, timeout=5)
+        elif args.command == "daemon":
+            Daemon().serve()
+        elif args.command == "quit":
+            info = daemon_info()
+            if info and ping(info):
+                send(info, {"cmd": "quit"})
+    except AuthError as error:
+        print(f"sxm: {error}", file=sys.stderr)
+        return 3
+    except SxmError as error:
+        print(f"sxm: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
