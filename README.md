@@ -1,5 +1,7 @@
 # SiriusXM for Omarchy
 
+![SiriusXM panel](preview.png)
+
 Listen to SiriusXM live channels from the Omarchy bar. Click the radio icon
 for a panel with now playing (track, artist, art), transport and volume
 controls, a searchable channel list, a genre filter, and favorites. Playback
